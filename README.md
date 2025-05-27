@@ -74,4 +74,11 @@ We overcame these challenges using model fine-tuning, performance optimizations,
 
 ---
 
+## 🤝 Contributions  
+- Pavan J: AI engineer
+- Aditya Agarwal: ML engineer, Backend Developer
+- Nehil Chandrakar: Full Stack Developer
+- Ayush Shankar Prasad: Data Scientist, Data Analyst 
+
+
 📫 *Feel free to fork, contribute, and share feedback!*
