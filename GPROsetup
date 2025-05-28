@@ -1,0 +1,226 @@
+from unsloth import FastLanguageModel, is_bfloat16_supported
+import torch
+import re
+import pandas as pd
+import json
+import singlestoredb as s2
+import ollama
+from datasets import Dataset
+from trl import GRPOConfig, GRPOTrainer
+from transformers import BitsAndBytesConfig
+from peft import PeftModel
+
+# Constants
+max_seq_length = 1024
+lora_rank = 64
+
+# Define quantization config
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True
+)
+
+# Load the base language model with quantization and LoRA configuration
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="google/gemma-3-4b-it",
+    max_seq_length=max_seq_length,
+    quantization_config=quant_config,
+    fast_inference=False,  # Required for compatibility
+    max_lora_rank=lora_rank,
+    gpu_memory_utilization=0.5
+)
+
+# Apply LoRA to reduce training parameters and memory usage
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=lora_rank,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=lora_rank,
+    use_gradient_checkpointing="unsloth",
+    random_state=3407,
+)
+
+# System prompt to guide dish generation behavior
+SYSTEM_PROMPT = """
+Given a description of food, provide a list of 20 food dishes that match the description. List each dish on a new line. Provide Indian food dishes unless the user specifically describes a foreign one. The dishes cant be regional ones which people havent heard much. The output format should be dish1 /n dish2 /n dish3 .... /n dish 20. If you give recipe, or other unnnessary text, you will be penalised
+"""
+
+# Get sentence embeddings using ollama API
+def get_embeddings(sentence: str) -> list[float]:
+    response = ollama.embeddings(
+        model="bge-m3:latest",
+        prompt=sentence
+    )
+    return response["embedding"]
+
+# Retrieve most relevant dishes from vector DB
+
+def get_vector_db_dishes(description: str) -> list[str]:
+    embeddings = get_embeddings(description)
+    embeddings_json = json.dumps(embeddings)
+
+    with s2.connect("Single Store Connection String") as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT food
+                FROM food
+                ORDER BY embedding <-> %s
+                LIMIT 20
+            """, (embeddings_json,))
+            results = cur.fetchall()
+            return [row[0] for row in results]
+
+# Load dataset from Excel file
+def load_food_descriptions(file_path: str = "merged_output.xlsx") -> Dataset:
+    df = pd.read_excel(file_path)
+    descriptions = df.iloc[:, 1].dropna().tolist()
+    data = {
+        "prompt": [[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": desc}
+        ] for desc in descriptions],
+        "description": descriptions
+    }
+    return Dataset.from_dict(data)
+
+# Load training data
+dataset = load_food_descriptions()
+
+# Reward Function: Checks semantic similarity using shared keywords from vector DB
+
+def match_reward_func(prompts, completions, **kwargs) -> list[float]:
+    responses = [completion[0]["content"] for completion in completions]
+    descriptions = [prompt[-1]["content"] for prompt in prompts]
+
+    rewards = []
+    for desc, response in zip(descriptions, responses):
+        expected_dishes = get_vector_db_dishes(desc)
+        model_dishes = response.strip().split("\n")
+
+        has_extra_text = False
+        cleaned_dishes = []
+        for line in model_dishes:
+            line = line.strip()
+            if not line:
+                has_extra_text = True
+                continue
+            if re.match(r"^\d+\.?\s+", line) or len(line.split()) > 5 or line.lower().startswith(("okay", "here", "list")):
+                has_extra_text = True
+            else:
+                cleaned_dishes.append(line)
+
+        expected_words = {word for dish in expected_dishes for word in dish.lower().split()}
+        model_words = {word for dish in cleaned_dishes for word in dish.lower().split()}
+
+        matches = len(expected_words.intersection(model_words))
+        reward = min(matches * 0.05, 2.0)
+        if has_extra_text:
+            reward *= 0.5
+
+        rewards.append(reward)
+    return rewards
+
+# Reward Function: Enforces exact 20-line format
+def format_reward_func(completions, **kwargs) -> list[float]:
+    responses = [completion[0]["content"] for completion in completions]
+    rewards = []
+    for response in responses:
+        lines = response.strip().split("\n")
+        valid = len(lines) == 20 and all(
+            line.strip() and
+            not re.match(r"^\d+\.?\s+", line.strip()) and
+            len(line.strip().split()) <= 5 and
+            not line.lower().startswith(("okay", "here", "list"))
+            for line in lines
+        )
+        rewards.append(1.0 if valid else 0.0)
+    return rewards
+
+# Reward Function: Simple non-empty output check
+def non_empty_reward_func(completions, **kwargs) -> list[float]:
+    responses = [completion[0]["content"] for completion in completions]
+    return [0.5 if response.strip() else 0.0 for response in responses]
+
+# RLHF training configuration
+training_args = GRPOConfig(
+    use_vllm=False,
+    learning_rate=5e-6,
+    adam_beta1=0.9,
+    adam_beta2=0.99,
+    weight_decay=0.1,
+    warmup_ratio=0.1,
+    lr_scheduler_type="cosine",
+    optim="adamw_8bit",
+    logging_steps=1,
+    bf16=is_bfloat16_supported(),
+    fp16=not is_bfloat16_supported(),
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=1,
+    num_generations=2,
+    max_prompt_length=512,
+    max_completion_length=400,
+    max_steps=200,
+    save_steps=10,
+    max_grad_norm=0.1,
+    report_to="none",
+    output_dir="outputs",
+)
+
+# Instantiate trainer
+trainer = GRPOTrainer(
+    model=model,
+    processing_class=tokenizer,
+    reward_funcs=[
+        match_reward_func,
+        format_reward_func,
+        non_empty_reward_func
+    ],
+    args=training_args,
+    train_dataset=dataset,
+)
+
+# Train the model
+trainer.train()
+
+# Perform inference before saving LoRA
+example_description = "Tamatar Pyaz Ki Sabzi Recipe - Tomato Onion Sabzi ..."
+text = tokenizer.apply_chat_template([
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": example_description},
+], tokenize=False, add_generation_prompt=True)
+
+inputs = tokenizer(text, return_tensors="pt").to("cuda")
+outputs = model.generate(
+    **inputs,
+    max_length=1024,
+    temperature=0.8,
+    top_p=0.95,
+    do_sample=True
+)
+output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Inference before saving LoRA:\n{output}")
+
+# Save the LoRA-adapted model
+model.save_pretrained("foodlora")
+
+# Load the saved model with LoRA weights
+model = PeftModel.from_pretrained(model, "foodlora")
+
+# Inference after loading LoRA
+text = tokenizer.apply_chat_template([
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": example_description},
+], tokenize=False, add_generation_prompt=True)
+
+inputs = tokenizer(text, return_tensors="pt").to("cuda")
+outputs = model.generate(
+    **inputs,
+    max_length=1024,
+    temperature=0.8,
+    top_p=0.95,
+    do_sample=True
+)
+output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Inference after saving LoRA:\n{output}")
